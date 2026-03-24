@@ -1,0 +1,15 @@
+node_modules/
+.env
+data.db
+sessions/*.session
+sessions/*.session-journal
+.gemini/
+dist/
+build/
+*.log
+tmp/
+brain/
+walkthrough.md
+task.md
+implementation_plan.md
+implementation_plan_agent.md

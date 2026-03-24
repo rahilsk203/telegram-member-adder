@@ -1,0 +1,22 @@
+{
+  "name": "telegram-daily-adder",
+  "version": "1.0.0",
+  "description": "Telegram daily member adder logic that automatically adds users to a target group.",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node src/index.js",
+    "setup": "node --eval \"import('./src/index.js').then(m => m.runSetup())\""
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.7.1",
+    "@noble/secp256k1": "^2.1.0",
+    "better-sqlite3": "^11.5.0",
+    "dotenv": "^16.4.5",
+    "input": "^1.0.1",
+    "node-cron": "^3.0.3",
+    "openai": "^4.71.1",
+    "telegram": "^2.26.15"
+  }
+}

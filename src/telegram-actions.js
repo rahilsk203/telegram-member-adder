@@ -102,12 +102,20 @@ export async function addContact(client, user) {
 }
 
 export async function handleTelegramError(err) {
-    const msg = err.message || "";
-    if (msg.includes('FLOOD_WAIT') || msg.includes('wait of') && msg.includes('seconds is required')) {
+    const msg = (err.message || err.errorMessage || "").toUpperCase();
+    if (msg.includes('FLOOD_WAIT') || msg.includes('WAIT OF') && msg.includes('SECONDS IS REQUIRED')) {
         const match = msg.match(/\d+/);
         const seconds = match ? parseInt(match[0]) : 60;
         logger.warn(`Flood wait detected! ${seconds} seconds required.`);
-        return { type: 'FLOOD', seconds };
+        return { type: 'FLOOD', seconds: seconds };
+    }
+    if (msg.includes('PEER_FLOOD') || msg.includes('FLOOD_PEER')) {
+        logger.error("PEER_FLOOD / FLOOD_PEER detected! Account is likely blocked for 24h.");
+        return { type: 'FLOOD', seconds: 86400 }; 
+    }
+    if (msg.includes('CHAT_WRITE_FORBIDDEN') || msg.includes('CHAT_SEND_WEBPAGE_FORBIDDEN') || msg.includes('CHAT_ADMIN_REQUIRED')) {
+        logger.warn("Group is restricted or forbidden. Recommend leaving.");
+        return { type: 'FORBIDDEN' };
     }
     return null;
 }
@@ -141,7 +149,7 @@ export async function getJoinedGroups(client) {
     }
 }
 
-export async function inviteToChannel(client, targetChannel, users) {
+export async function inviteToChannel(client, targetChannel, users, accountName = 'session') {
     let addedCount = 0;
     
     // Resolve target channel
@@ -150,7 +158,7 @@ export async function inviteToChannel(client, targetChannel, users) {
         targetEntity = await client.getEntity(targetChannel);
     } catch (err) {
         logger.error("Could not resolve target channel entity:", err.message);
-        return addedCount;
+        return { addedCount, floodWait: 0 };
     }
 
     for (const user of users) {
@@ -173,7 +181,7 @@ export async function inviteToChannel(client, targetChannel, users) {
             
             if (isIn) {
                 logger.success(`✅ SUCCESS: ${user.username} is now a member.`);
-                recordAddedUser(user.id, user.username);
+                recordAddedUser(user.id, user.username, accountName);
                 addedCount++;
             } else {
                 logger.warn(`❌ FAILED: ${user.username} invitation sent but not in channel (restricted).`);
@@ -182,24 +190,24 @@ export async function inviteToChannel(client, targetChannel, users) {
             await randomDelay(config.delayBetweenAddsMinMs, config.delayBetweenAddsMaxMs);
 
         } catch (err) {
-            const msg = err.message || "";
+            const msg = (err.message || "").toUpperCase();
             const handled = await handleTelegramError(err);
             if (handled && handled.type === 'FLOOD') {
-                logger.error(`CRITICAL: Flood wait of ${handled.seconds}s required. Stopping batch.`);
+                logger.error(`CRITICAL: Flood/Peer wait of ${handled.seconds}s required. Stopping batch.`);
                 return { addedCount, floodWait: handled.seconds };
             }
 
             if (msg.includes('USER_PRIVACY_RESTRICTED')) {
                 logger.warn(`Privacy Restricted: ${user.username}`);
-                recordAddedUser(user.id, user.username); 
+                recordAddedUser(user.id, user.username, accountName); 
             } else if (msg.includes('USER_ALREADY_PARTICIPANT')) {
                 logger.info(`${user.username} already in.`);
-                recordAddedUser(user.id, user.username);
+                recordAddedUser(user.id, user.username, accountName);
             } else if (msg.includes('USER_NOT_MUTUAL_CONTACT')) {
                 logger.warn(`Mutual Req: ${user.username}`);
-                recordAddedUser(user.id, user.username); 
+                recordAddedUser(user.id, user.username, accountName); 
             } else {
-                logger.error(`Error adding ${user.username}:`, msg);
+                logger.error(`Error adding ${user.username}:`, err.message);
             }
         }
     }
@@ -240,15 +248,30 @@ export async function forwardMessage(client, toPeer, fromPeer, messageId) {
                 toPeer: toPeer,
             })
         );
-        logger.success(`Message forwarded to ${toPeer.username || toPeer}`);
-        return true;
+        logger.success(`Message forwarded to ${toPeer.username || toPeer.title || toPeer.id}`);
+        return { success: true };
     } catch (err) {
         const handled = await handleTelegramError(err);
         if (handled && handled.type === 'FLOOD') {
             await sleep(handled.seconds * 1000);
             return await forwardMessage(client, toPeer, fromPeer, messageId);
         }
+        if (handled && handled.type === 'FORBIDDEN') {
+            return { success: false, errorType: 'FORBIDDEN' };
+        }
         logger.error(`Error forwarding message to ${toPeer}:`, err.message);
+        return { success: false, errorType: 'OTHER' };
+    }
+}
+
+export async function leaveChannel(client, channel) {
+    try {
+        const entity = await client.getEntity(channel);
+        await client.invoke(new Api.channels.LeaveChannel({ channel: entity }));
+        logger.info(`Left channel/group: ${channel.username || channel.title || channel}`);
+        return true;
+    } catch (err) {
+        logger.error(`Error leaving channel:`, err.message);
         return false;
     }
 }

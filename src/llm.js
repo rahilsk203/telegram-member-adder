@@ -4,28 +4,37 @@ import { logger } from './utils.js';
 
 // Helper to get the final result from Grok stream with retries
 async function getGrokResponse(prompt, retries = 3) {
+    let currentModel = config.llm.model;
     for (let i = 0; i < retries; i++) {
         try {
-            const grok = new Grok(config.llm.model);
+            const grok = new Grok(currentModel);
             const stream = await grok.startConvo(prompt);
             
             let finalData = null;
+            let accumulatedTokens = "";
+
             for await (const chunk of stream) {
                 if (chunk.type === 'final') {
                     finalData = chunk.data.response;
+                } else if (chunk.type === 'token') {
+                    accumulatedTokens += chunk.data;
                 }
             }
             
-            if (finalData) return finalData;
+            const result = finalData || accumulatedTokens;
+            if (result && result.trim().length > 0) {
+                return result;
+            }
             
-            logger.warn(`Grok response attempt ${i + 1} failed (no final message). Retrying...`);
+            logger.warn(`Grok (${currentModel}) attempt ${i + 1} empty. Retrying with Fast model...`);
+            currentModel = "grok-3-fast"; // Switch to fast model for subsequent retries
         } catch (err) {
             logger.error(`Grok connection attempt ${i + 1} failed:`, err.message);
             if (i === retries - 1) throw err;
         }
-        await new Promise(r => setTimeout(r, 5000)); // Wait before retry
+        await new Promise(r => setTimeout(r, 6000 + Math.random() * 2000));
     }
-    throw new Error("Failed to get final response from Grok after multiple attempts");
+    throw new Error("Grok failed to return content. Account might be limited.");
 }
 
 export async function generateKeywords(niche) {

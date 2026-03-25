@@ -27,8 +27,10 @@ db.exec(`
     );
 
     CREATE TABLE IF NOT EXISTS daily_logs (
-        date TEXT PRIMARY KEY,
-        adds_count INTEGER DEFAULT 0
+        date TEXT,
+        account TEXT,
+        adds_count INTEGER DEFAULT 0,
+        PRIMARY KEY(date, account)
     );
 
     CREATE TABLE IF NOT EXISTS agent_history (
@@ -38,26 +40,34 @@ db.exec(`
         thought TEXT,
         result TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS post_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id TEXT,
+        message_id INTEGER,
+        posted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(group_id, message_id)
+    );
 `);
 
-export function getAddedTodayCount() {
+export function getAddedTodayCount(account = 'session') {
     const today = new Date().toISOString().split('T')[0];
-    const row = db.prepare('SELECT adds_count FROM daily_logs WHERE date = ?').get(today);
+    const row = db.prepare('SELECT adds_count FROM daily_logs WHERE date = ? AND account = ?').get(today, account);
     return row ? row.adds_count : 0;
 }
 
-export function incrementAddedToday() {
+export function incrementAddedToday(account = 'session') {
     const today = new Date().toISOString().split('T')[0];
     db.prepare(`
-        INSERT INTO daily_logs (date, adds_count)
-        VALUES (?, 1)
-        ON CONFLICT(date) DO UPDATE SET adds_count = adds_count + 1
-    `).run(today);
+        INSERT INTO daily_logs (date, account, adds_count)
+        VALUES (?, ?, 1)
+        ON CONFLICT(date, account) DO UPDATE SET adds_count = adds_count + 1
+    `).run(today, account);
 }
 
-export function recordAddedUser(userId, username) {
+export function recordAddedUser(userId, username, account = 'session') {
     db.prepare('INSERT OR IGNORE INTO added_users (user_id, username) VALUES (?, ?)').run(String(userId), username || '');
-    incrementAddedToday();
+    incrementAddedToday(account);
 }
 
 export function isUserAlreadyAdded(userId) {
@@ -92,4 +102,14 @@ export function getRecentAgentHistory(limit = 15) {
     const stmt = db.prepare('SELECT timestamp, action, thought, result FROM agent_history ORDER BY id DESC LIMIT ?');
     const rows = stmt.all(limit);
     return rows.reverse(); // Return in chronological order for the LLM
+}
+// --- POST HISTORY ---
+
+export function hasAlreadyPosted(groupId, messageId) {
+    const row = db.prepare('SELECT 1 FROM post_history WHERE group_id = ? AND message_id = ?').get(String(groupId), messageId);
+    return !!row;
+}
+
+export function recordPost(groupId, messageId) {
+    db.prepare('INSERT OR IGNORE INTO post_history (group_id, message_id) VALUES (?, ?)').run(String(groupId), messageId);
 }

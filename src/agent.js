@@ -1,14 +1,14 @@
-import { getClient } from './client.js';
+import { getClient, getAvailableSessions } from './client.js';
 import { getAgentDecision, scoreUsers } from './llm.js';
 import { 
     searchPublicGroups, joinChannel, getActiveParticipants, 
-    addContact, inviteToChannel, getLatestMessage, 
-    forwardMessage, sendMessage, getJoinedGroups,
-    getParticipantCount
+    inviteToChannel, addContact, getJoinedGroups, getLatestMessage,
+    forwardMessage, handleTelegramError, leaveChannel, getParticipantCount
 } from './telegram-actions.js';
 import { 
     saveScrapedUsers, getAddedTodayCount, isUserAlreadyAdded, 
-    getAllScrapedUsers, saveAgentActivity, getRecentAgentHistory
+    getAllScrapedUsers, saveAgentActivity, getRecentAgentHistory,
+    hasAlreadyPosted, recordPost
 } from './storage.js';
 import { config } from './config.js';
 import { logger, sleep, randomDelay } from './utils.js';
@@ -16,7 +16,11 @@ import { logger, sleep, randomDelay } from './utils.js';
 export class GrokAgent {
     constructor() {
         this.client = null;
+        const sessions = getAvailableSessions();
         this.state = {
+            accounts: sessions,
+            currentAccountIndex: 0,
+            currentAccount: sessions[0] || 'session',
             addedToday: 0,
             dailyLimit: config.dailyAddLimit,
             targetChannel: "-1003899699628",
@@ -26,6 +30,7 @@ export class GrokAgent {
             niche: config.niche,
             lastAction: "Just started",
             floodWaitSeconds: 0,
+            peerFloodDetected: false,
             currentTime: new Date().toLocaleString(),
             lastPostTimestamp: "Never",
             lastAddTimestamp: "Never",
@@ -43,13 +48,28 @@ export class GrokAgent {
     }
 
     async init() {
-        this.client = await getClient();
+        this.client = await getClient(this.state.currentAccount);
         this.state.history = getRecentAgentHistory(15);
         await this.updateState();
     }
 
+    async switchAccount() {
+        if (this.state.accounts.length <= 1) {
+            logger.warn("No other accounts available for rotation.");
+            return false;
+        }
+        this.state.currentAccountIndex = (this.state.currentAccountIndex + 1) % this.state.accounts.length;
+        this.state.currentAccount = this.state.accounts[this.state.currentAccountIndex];
+        logger.info(`Rotating to account: [${this.state.currentAccount}]`);
+        
+        if (this.client) await this.client.disconnect();
+        this.client = await getClient(this.state.currentAccount);
+        await this.updateState();
+        return true;
+    }
+
     async updateState() {
-        this.state.addedToday = getAddedTodayCount();
+        this.state.addedToday = getAddedTodayCount(this.state.currentAccount);
         const scraped = getAllScrapedUsers().filter(u => !isUserAlreadyAdded(u.user_id));
         this.state.recentlyScrapedCount = scraped.length;
         this.state.currentParticipantCount = await getParticipantCount(this.client, this.state.targetChannel);
@@ -63,13 +83,13 @@ export class GrokAgent {
         
         let loop = true;
         let cycles = 0;
-        const maxCycles = 20;
+        const maxCycles = 30; // Increased for advanced long-term tasks
 
         while (loop && cycles < maxCycles) {
             await this.updateState();
             cycles++;
             
-            logger.info(`--- Agent Cycle ${cycles} ---`);
+            logger.info(`--- Power Agent Cycle ${cycles} ---`);
             const decision = await getAgentDecision(this.state, this.tools);
             
             logger.info("Agent Thought: " + (decision.thought || "No clear thought."));
@@ -83,6 +103,17 @@ export class GrokAgent {
             try {
                 await this.executeAction(decision.action, decision.args || {});
                 saveAgentActivity(decision.action, decision.thought, this.state.lastAction);
+
+                // Auto-Rotation Check: If flood wait is > 1 hour, switch account!
+                if (this.state.floodWaitSeconds >= 3600 || this.state.peerFloodDetected) {
+                    logger.warn("Long-term block detected on current account. Attempting rotation...");
+                    const success = await this.switchAccount();
+                    if (success) {
+                        this.state.floodWaitSeconds = 0;
+                        this.state.peerFloodDetected = false;
+                        this.state.lastAction = "Rotated account to bypass limit";
+                    }
+                }
             } catch (err) {
                 logger.error(`Error executing agent action ${decision.action}:`, err.message);
                 this.state.lastAction = `Failed: ${decision.action} (${err.message})`;
@@ -124,29 +155,42 @@ export class GrokAgent {
                     this.state.lastAction = "No users to add in DB";
                     return;
                 }
-                const neededCount = this.state.dailyLimit - this.state.addedToday;
-                if (neededCount <= 0) {
-                    this.state.lastAction = "Daily limit reached";
+                if (this.state.addedToday >= this.state.dailyLimit) {
+                    logger.info(`Account [${this.state.currentAccount}] reached daily limit. Attempting rotation...`);
+                    const success = await this.switchAccount();
+                    if (!success) {
+                        this.state.lastAction = "Daily limit reached, no more accounts.";
+                        return;
+                    }
+                }
+
+                const usersToAdd = getAllScrapedUsers().filter(u => !isUserAlreadyAdded(u.user_id));
+                const selected = await scoreUsers(usersToAdd, config.niche);
+                
+                if (selected.length === 0) {
+                    this.state.lastAction = "No users to add.";
                     return;
                 }
-                const topUsers = await scoreUsers(allScraped, this.state.niche);
-                const selected = topUsers.slice(0, neededCount);
+
+                // Add to contacts first
                 for (const u of selected) {
                     const addResult = await addContact(this.client, u);
                     if (addResult.floodWait > 0) {
                         logger.warn(`Throttled at AddContact level! Stopping batch.`);
                         this.state.floodWaitSeconds = addResult.floodWait;
+                        if (addResult.floodWait >= 3600) this.state.peerFloodDetected = true;
                         this.state.lastAction = `Contact Flood Wait: ${addResult.floodWait}s`;
                         return;
                     }
                     await randomDelay(2000, 5000);
                 }
-                const result = await inviteToChannel(this.client, this.state.targetChannel, selected);
+                const result = await inviteToChannel(this.client, this.state.targetChannel, selected, this.state.currentAccount);
                 this.state.floodWaitSeconds = result.floodWait;
+                if (result.floodWait >= 3600) this.state.peerFloodDetected = true;
                 this.state.lastAction = `Added ${result.addedCount} users. Flood wait: ${result.floodWait}s`;
                 this.state.lastAddTimestamp = new Date().toLocaleString();
                 break;
-// ... (skip searching)
+
             case 'postToGroups':
                 const msg = await getLatestMessage(this.client, this.state.sourceChannelId);
                 if (!msg) {
@@ -158,12 +202,25 @@ export class GrokAgent {
                 for (const g of existing) {
                     if (count >= 5) break;
                     if (g.username && !g.username.toLowerCase().includes("dailyaitoolsfree")) {
-                        await forwardMessage(this.client, g, this.state.sourceChannelId, msg.id);
-                        count++;
-                        await randomDelay(15000, 30000);
+                        // Duplicate Check
+                        if (hasAlreadyPosted(g.id, msg.id)) {
+                            logger.info(`Skipping duplicate post for ${g.username || g.title}`);
+                            continue;
+                        }
+
+                        const forwardResult = await forwardMessage(this.client, g, this.state.sourceChannelId, msg.id);
+                        
+                        if (forwardResult.success) {
+                            recordPost(g.id, msg.id);
+                            count++;
+                            await randomDelay(15000, 30000);
+                        } else if (forwardResult.errorType === 'FORBIDDEN') {
+                            logger.warn(`Group ${g.username || g.title} is forbidden. Cleaning up...`);
+                            await leaveChannel(this.client, g);
+                        }
                     }
                 }
-                this.state.lastAction = `Posted to ${count} groups.`;
+                this.state.lastAction = `Posted to ${count} groups. Cleaned up restricted ones.`;
                 this.state.lastPostTimestamp = new Date().toLocaleString();
                 break;
 

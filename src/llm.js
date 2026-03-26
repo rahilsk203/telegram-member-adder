@@ -1,117 +1,282 @@
-import { Grok } from '../core/grok.js';
-import { config } from './config.js';
+import { llmRouter, TaskType } from './llm-providers.js';
 import { logger } from './utils.js';
 
-// Helper to get the final result from Grok stream with retries
-async function getGrokResponse(prompt, retries = 3) {
-    let currentModel = config.llm.model;
-    for (let i = 0; i < retries; i++) {
+/**
+ * Extract JSON from LLM response with better handling
+ */
+function extractJSON(text, isArray = false) {
+    try {
+        // Try direct parse first
         try {
-            const grok = new Grok(currentModel);
-            const stream = await grok.startConvo(prompt);
-            
-            let finalData = null;
-            let accumulatedTokens = "";
+            return JSON.parse(text);
+        } catch (e) {
+            // Continue to regex extraction
+        }
 
-            for await (const chunk of stream) {
-                if (chunk.type === 'final') {
-                    finalData = chunk.data.response;
-                } else if (chunk.type === 'token') {
-                    accumulatedTokens += chunk.data;
+        // Try to find JSON with regex
+        let regex;
+        if (isArray) {
+            regex = /\[[\s\S]*?\]/;
+        } else {
+            regex = /\{[\s\S]*?\}/;
+        }
+
+        const match = text.match(regex);
+        if (match) {
+            return JSON.parse(match[0]);
+        }
+
+        // Try stripping markdown code blocks
+        const stripped = text.replace(/```json\n?/gi, '').replace(/```\n?/gi, '').trim();
+        try {
+            return JSON.parse(stripped);
+        } catch (e) {
+            // Continue
+        }
+
+        // Try stripping "Thinking" or other prefixes
+        const lines = text.split('\n');
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if ((isArray && trimmed.startsWith('[')) || (!isArray && trimmed.startsWith('{'))) {
+                try {
+                    return JSON.parse(trimmed);
+                } catch (e) {
+                    // Continue
                 }
             }
-            
-            const result = finalData || accumulatedTokens;
-            if (result && result.trim().length > 0) {
-                return result;
-            }
-            
-            logger.warn(`Grok (${currentModel}) attempt ${i + 1} empty. Retrying with Fast model...`);
-            currentModel = "grok-3-fast"; // Switch to fast model for subsequent retries
-        } catch (err) {
-            logger.error(`Grok connection attempt ${i + 1} failed:`, err.message);
-            if (i === retries - 1) throw err;
         }
-        await new Promise(r => setTimeout(r, 6000 + Math.random() * 2000));
+
+        logger.error("Failed to extract JSON from response");
+        return null;
+    } catch (err) {
+        logger.error("JSON extraction error:", err.message);
+        return null;
     }
-    throw new Error("Grok failed to return content. Account might be limited.");
 }
 
+/**
+ * Generate search keywords for a niche using LLM
+ */
 export async function generateKeywords(niche) {
     try {
-        const prompt = `You are a Telegram group analysis expert. The user wants to find public Telegram groups related to the niche: "${niche}".
-Provide a JSON array of 8-12 smart, highly relevant search keywords to find groups where active users might be. Do not include '#' symbols. Use language that users looking for this niche would search for.
-Output ONLY a valid JSON array of strings, nothing else. Example: ["keyword1", "keyword 2"]`;
-
-        const reply = await getGrokResponse(prompt);
-        const jsonMatch = reply.match(/\[.*\]/s);
-        const keywordsArray = jsonMatch ? JSON.parse(jsonMatch[0]) : JSON.parse(reply);
+        const prompt = `You are a Telegram group discovery expert. The user wants to find public Telegram groups related to the niche: "${niche}".
         
+Provide a JSON array of 8-12 smart, highly relevant search keywords to find groups where active users might be interested in this topic. 
+
+Requirements:
+- Do not include '#' symbols
+- Use language that users looking for this niche would search for
+- Include variations: broad terms, specific terms, trending terms
+- Mix of English and local language terms if appropriate
+
+Output ONLY a valid JSON array of strings, nothing else. 
+Example: ["keyword1", "keyword 2", "ai tools", "chatgpt alternatives"]`;
+
+        const reply = await llmRouter.getResponse(TaskType.GENERAL, prompt);
+        const keywordsArray = extractJSON(reply, true);
+
+        if (!keywordsArray || !Array.isArray(keywordsArray)) {
+            logger.error("Invalid keywords response, using fallback");
+            return [niche];
+        }
+
         return keywordsArray.slice(0, 12);
     } catch (error) {
-        logger.error("Error generating keywords from Grok:", error.message);
+        logger.error("Error generating keywords:", error.message);
         return [niche]; // Fallback
     }
 }
 
-export async function scoreUsers(users, niche) {
-    if (!users || users.length === 0) return [];
+/**
+ * Score and rank Telegram groups by quality for posting
+ */
+export async function scoreGroups(groups, niche) {
+    if (!groups || groups.length === 0) return [];
 
     try {
-        // We only send minimal data to save tokens
-        const userData = users.map(u => ({ id: u.id, username: u.username }));
-        
-        const prompt = `You are an expert at selecting high-quality Telegram users for the niche: "${niche}".
-Here is a list of scraped users:
-${JSON.stringify(userData)}
+        const groupData = groups.map(g => ({
+            username: g.username,
+            title: g.title,
+            members: g.participantsCount || g.members || 0
+        }));
 
-Select the top 20 users who are most likely to be engaged, real users based on their username (avoid obvious bots, spam names, admins, or support accounts). 
-Return ONLY a JSON array of the "id"s of the selected users (as strings or numbers). Do not return anything else.`;
+        const prompt = `You are an expert at evaluating Telegram groups for content posting suitability.
 
-        const reply = await getGrokResponse(prompt);
-        const jsonMatch = reply.match(/\[.*\]/s);
-        let selectedIds = jsonMatch ? JSON.parse(jsonMatch[0]) : JSON.parse(reply);
+Niche: "${niche}"
 
-        selectedIds = selectedIds.map(String);
-        return users.filter(u => selectedIds.includes(String(u.id))).slice(0, 20);
+Here is a list of Telegram groups to evaluate:
+${JSON.stringify(groupData, null, 2)}
+
+Scoring Criteria (1-10 scale):
+1. RELEVANCE (0-3 points): How directly related is the group to the niche?
+2. QUALITY (0-3 points): Is it a professional, active community (not spam/bot-filled)?
+3. POSTING POTENTIAL (0-2 points): Likely to accept and engage with content?
+4. SIZE APPROPRIATENESS (0-2 points): Sweet spot is 500-50k members (not too small, not too corporate)
+
+Return ONLY a valid JSON array where each element contains:
+{
+  "username": "groupusername",
+  "qualityScore": 8.5,
+  "reasoning": "Brief explanation"
+}
+
+Order by qualityScore descending. Return all groups with scores.
+
+Example output:
+[{"username": "technews", "qualityScore": 8.5, "reasoning": "Active tech community..."}]`;
+
+        const reply = await llmRouter.getResponse(TaskType.GENERAL, prompt);
+        const scoredGroups = extractJSON(reply, true);
+
+        if (!scoredGroups || !Array.isArray(scoredGroups)) {
+            logger.error("Invalid scored groups response, using defaults");
+            return groups.map(g => ({
+                ...g,
+                qualityScore: 5.0,
+                reasoning: 'Default score (LLM unavailable)'
+            }));
+        }
+
+        // Merge scores with original group data
+        return groups.map(g => {
+            const scoreData = scoredGroups.find(s => s.username === g.username) || {};
+            return {
+                ...g,
+                qualityScore: scoreData.qualityScore || 5.0,
+                reasoning: scoreData.reasoning || 'No analysis available'
+            };
+        }).sort((a, b) => b.qualityScore - a.qualityScore);
+
     } catch (error) {
-        logger.error("Error scoring users from Grok:", error.message);
-        // Fallback: return random 20 users
-        return users.sort(() => 0.5 - Math.random()).slice(0, 20);
+        logger.error("Error scoring groups:", error.message);
+        // Fallback: return groups with default score
+        return groups.map(g => ({
+            ...g,
+            qualityScore: 5.0,
+            reasoning: 'Default score (LLM unavailable)'
+        }));
     }
 }
+
+/**
+ * Customize message for specific group
+ */
+export async function customizeMessage(message, groupName, niche) {
+    try {
+        const prompt = `You are a Telegram content curator. Adapt the following message for posting in a specific group.
+
+Original Message:
+"${message}"
+
+Target Group: "${groupName}"
+Group Niche: "${niche}"
+
+Requirements:
+- Keep the core message intact
+- Add a brief, relevant intro if appropriate (1-2 lines max)
+- Add relevant hashtags (max 3)
+- Keep it natural, not spammy
+- If the message is already perfect, return it unchanged
+
+Return ONLY the adapted message, nothing else.`;
+
+        const reply = await llmRouter.getResponse(TaskType.GENERAL, prompt);
+        return reply.trim();
+    } catch (error) {
+        logger.error("Error customizing message:", error.message);
+        return message; // Fallback: return original
+    }
+}
+
+/**
+ * Get agent decision using LLM
+ */
 export async function getAgentDecision(state, tools) {
     try {
-        const prompt = `You are a TELEGRAM CHANNEL MANAGER AGENT. Your mission: Grow the channel to 20 daily members and keep it active with tech posts.
-
-STRATEGY & PRIORITIES:
-1. DYNAMIC SWITCHING: If "addMembers" is blocked by a high "floodWaitSeconds", DO NOT wait doing nothing. SWITCH to "postToGroups" or "searchGroups" to stay productive.
-2. TIMING: Use "currentTime" vs "lastPostTimestamp" and "lastAddTimestamp" to decide if enough time has passed to look human.
-3. FORWARDING: You must post high-quality content to groups to keep the channel visible.
-4. SAFETY: If everything is blocked, use the "wait" tool for a long duration.
-
-AVAILABLE TOOLS:
-${JSON.stringify(tools, null, 2)}
+        const prompt = `You are a TELEGRAM CONTENT DISTRIBUTION AGENT. Your mission: Maximize posting reach by finding quality groups and distributing content.
 
 CURRENT STATE:
 ${JSON.stringify(state, null, 2)}
 
-YOUR THINKING PROCESS:
-- Analyze what is already done (added count, messages posted).
-- Decide the NEXT logical step.
-- If you have enough users scraped, add them.
-- If you haven't posted today, find groups and post.
-- If everything is done for today, use "finishTask".
+AVAILABLE TOOLS:
+${JSON.stringify(tools, null, 2)}
+
+STRATEGY & PRIORITIES:
+1. BALANCED APPROACH: Mix finding new groups with posting to existing ones
+2. QUALITY OVER QUANTITY: Prefer quality groups over just joining many
+3. EFFICIENCY: Use "searchAndPost" for comprehensive action
+4. DAILY LIMITS: Respect daily post limits (${state.postLimit})
+5. CLEANUP: Remove restricted groups to keep account healthy
+
+DECISION GUIDELINES:
+- If postedToday < 10: Focus on finding NEW groups and posting
+- If postedToday 10-30: Continue posting to new groups  
+- If postedToday >= 30: Mix posting + cleanup
+- If flood wait detected: Use wait tool or switch strategy
+- Always maintain variety in group discovery
+
+YOUR THINKING:
+- Analyze current posting progress
+- Decide next best action to maximize reach
+- Consider group quality and posting success rates
 
 OUTPUT FORMAT:
-Return ONLY a valid JSON object with "thought" (your reasoning) and "action" (tool name) with "args" (object).
-Example: { "thought": "I need more users to add.", "action": "searchGroups", "args": { "query": "AI tools" } }`;
+Return ONLY valid JSON:
+{ "thought": "Your reasoning here", "action": "toolName", "args": { "param": "value" } }
 
-        const reply = await getGrokResponse(prompt);
-        const jsonMatch = reply.match(/\{.*\}/s);
-        return jsonMatch ? JSON.parse(jsonMatch[0]) : JSON.parse(reply);
+Example actions:
+- { "action": "searchGroups", "args": { "query": "AI tools" } }
+- { "action": "searchAndPost", "args": { "keywords": ["tech", "ai"] } }
+- { "action": "postToGroups", "args": {} }
+- { "action": "cleanupGroups", "args": {} }
+- { "action": "wait", "args": { "seconds": 300 } }
+- { "action": "finishTask", "args": {} }`;
+
+        const reply = await llmRouter.getResponse(TaskType.WEB_SEARCH, prompt);
+        const decision = extractJSON(reply, false);
+
+        if (!decision || !decision.action) {
+            logger.error("Invalid decision response, using default");
+            return {
+                thought: "Error in reasoning, continuing with safe action",
+                action: "wait",
+                args: { seconds: 60 }
+            };
+        }
+
+        return decision;
     } catch (error) {
         logger.error("Error getting agent decision:", error.message);
-        return { thought: "Error in reasoning, skipping.", action: "wait", args: { ms: 10000 } };
+        return {
+            thought: "Error in reasoning, continuing with safe action",
+            action: "wait",
+            args: { seconds: 60 }
+        };
+    }
+}
+
+/**
+ * Analyze group performance
+ */
+export async function analyzeGroupPerformance(groupStats) {
+    try {
+        const prompt = `Analyze this Telegram group's posting performance:
+
+Group Stats:
+${JSON.stringify(groupStats, null, 2)}
+
+Provide insights on:
+1. Success rate (posts made vs attempts)
+2. Engagement quality
+3. Recommendations for improvement
+
+Return ONLY valid JSON with analysis and recommendations.`;
+
+        const reply = await llmRouter.getResponse(TaskType.GENERAL, prompt);
+        return extractJSON(reply, false);
+    } catch (error) {
+        logger.error("Error analyzing group:", error.message);
+        return null;
     }
 }

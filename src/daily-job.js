@@ -1,170 +1,366 @@
 import { getClient } from './client.js';
-import { generateKeywords, scoreUsers } from './llm.js';
-import { searchPublicGroups, joinChannel, getActiveParticipants, addContact, inviteToChannel, getLatestMessage, forwardMessage, sendMessage, getJoinedGroups } from './telegram-actions.js';
-import { saveScrapedUsers, getAddedTodayCount, isUserAlreadyAdded, getAllScrapedUsers } from './storage.js';
+import { generateKeywords, scoreGroups } from './llm.js';
+import {
+    searchPublicGroups, joinChannel, getJoinedGroups, getLatestMessage,
+    forwardMessage, sendMessage, sendCustomMessage, checkGroupPermissions, leaveChannel,
+    getGroupInfo
+} from './telegram-actions.js';
+import {
+    recordPost, getAllPostedGroups, recordGroupQuality, isRestrictedGroup,
+    recordRestrictedGroup, getGroupQuality
+} from './storage.js';
 import { config } from './config.js';
-import { logger, randomDelay } from './utils.js';
+import { logger, randomDelay, sleep } from './utils.js';
 
-export async function runPostForwardingJob(client) {
-    logger.info("Starting post forwarding job...");
-    const sourceChannelId = "-1003899699628"; 
-    
-    // 1. Get latest message
-    const msg = await getLatestMessage(client, sourceChannelId);
-    if (!msg) return;
-    logger.info(`Found latest message (ID: ${msg.id}).`);
+/**
+ * Advanced Daily Posting Job
+ * - Discovers high-quality groups
+ * - Joins and posts content
+ * - Cleans up restricted groups
+ * - Tracks quality metrics
+ */
+export async function runDailyPostJob() {
+    logger.info("========================================");
+    logger.info("🚀 STARTING ADVANCED DAILY POST JOB");
+    logger.info("========================================");
 
-    const targetGroups = [];
-
-    // 2. Add existing groups (Already joined Megagroups)
-    logger.info("Checking for already joined groups...");
-    const existingGroups = await getJoinedGroups(client);
-    for (const g of existingGroups) {
-        if (g.username && !g.username.toLowerCase().includes("dailyaitoolsfree")) {
-            targetGroups.push(g);
-        }
-    }
-    logger.info(`Found ${targetGroups.length} existing groups to post in.`);
-
-    // 3. Search for NEW tech groups using LLM for variety
-    logger.info("Using LLM to discover new tech niches...");
-    const techKeywords = await generateKeywords("latest technology and useful AI tools for productivity");
-    
-    for (const kw of techKeywords) {
-        if (targetGroups.length >= 10) break;
-        const groups = await searchPublicGroups(client, kw);
-        for (const g of groups) {
-            if (targetGroups.length >= 10) break;
-            if (g.username && !targetGroups.find(tg => tg.id.toString() === g.id.toString())) {
-                targetGroups.push(g);
-            }
-        }
-    }
-
-    // 3. Join and post
-    for (const group of targetGroups) {
-        logger.info(`Forwarding to group: ${group.username}`);
-        const joined = await joinChannel(client, group.username);
-        if (joined) {
-            await randomDelay(5000, 10000); // Wait before posting
-            const forwarded = await forwardMessage(client, group, sourceChannelId, msg.id);
-            
-            // Fallback: If forward fails (e.g. admin required), try sending text
-            if (!forwarded && msg.message) {
-                logger.info("Attempting to send as text fallback...");
-                await sendMessage(client, group, msg.message);
-            }
-            
-            await randomDelay(15000, 30000); // Safety delay between groups
-        }
-    }
-    logger.success("Post forwarding job complete.");
-}
-
-export async function runDailyJob() {
-    logger.info("Starting up daily routine...");
-    
     let client;
     try {
         client = await getClient();
     } catch (err) {
-        logger.error("Failed to initialize Telegram client:", err.message);
+        logger.error("❌ Failed to initialize Telegram client:", err.message);
         return;
     }
 
-    // --- PART 1: MEMBER ADDER ---
-    const addedToday = getAddedTodayCount();
-    if (addedToday >= config.dailyAddLimit) {
-        logger.info(`Already reached daily member adder limit of ${config.dailyAddLimit}. Skipping adder part.`);
-    } else {
-        try {
-            await runMemberAdder(client, addedToday);
-        } catch (err) {
-            logger.error("Error in member adder part:", err.message);
+    const sourceChannelId = config.sourceChannel;
+
+    // Step 1: Get latest message from source
+    logger.info("📥 Fetching latest message...");
+    const msg = await getLatestMessage(client, sourceChannelId);
+    if (!msg) {
+        logger.error("❌ No message found in source channel!");
+        return;
+    }
+    logger.success(`✅ Got message (ID: ${msg.id})`);
+    logger.info(`   Preview: ${msg.message?.substring(0, 80)}...`);
+
+    // Step 2: Get existing joined groups
+    logger.info("📋 Checking existing groups...");
+    const existingGroups = await getJoinedGroups(client);
+    logger.info(`   Already joined: ${existingGroups.length} groups`);
+
+    const targetGroups = [];
+
+    // Add existing high-quality groups
+    for (const g of existingGroups) {
+        const username = g.username || g.title;
+
+        // Skip if restricted
+        if (isRestrictedGroup(username)) {
+            continue;
+        }
+
+        // Check quality
+        const quality = getGroupQuality(username);
+
+        // Add if quality is good or unknown
+        if (!quality || quality.qualityScore >= 5) {
+            targetGroups.push(g);
+        } else {
+            logger.info(`⏭️ Skipping low-quality group: ${username}`);
         }
     }
 
-    // --- PART 2: POST FORWARDING ---
-    try {
-        await runPostForwardingJob(client);
-    } catch (err) {
-        logger.error("Error in post forwarding job:", err.message);
-    }
-    
-    logger.success(`Daily routine complete.`);
-}
+    logger.info(`📊 Target groups after filtering: ${targetGroups.length}`);
 
-async function runMemberAdder(client, addedToday) {
-    logger.info("Starting member adder portion...");
-
-    // 1. LLM generate keywords
-    logger.info(`Generating keywords for niche: ${config.niche}`);
+    // Step 3: Discover NEW groups using LLM keywords
+    logger.info("🔍 Generating search keywords...");
     const keywords = await generateKeywords(config.niche);
-    logger.info(`Generated keywords: ${keywords.join(', ')}`);
+    logger.info(`   Keywords: ${keywords.join(', ')}`);
 
-    let scrapedUsers = [];
-
-    // 2. Search & join groups, scrape members
     for (const kw of keywords) {
-        if (scrapedUsers.length >= 300) break;
+        if (targetGroups.length >= 15) break; // Limit to 15 groups
 
-        logger.info(`Searching groups for keyword: ${kw}`);
+        logger.info(`\n🔎 Searching: "${kw}"`);
         const groups = await searchPublicGroups(client, kw);
-        
-        for (const group of groups) {
-            if (scrapedUsers.length >= 300) break;
+        logger.info(`   Found ${groups.length} groups`);
 
-            await joinChannel(client, group.username);
-            await randomDelay(10000, 20000); // 10-20s delay after joining
+        for (const g of groups) {
+            if (targetGroups.length >= 15) break;
 
-            logger.info(`Scraping active members from ${group.username}...`);
-            const participants = await getActiveParticipants(client, group);
-            
-            // Filter out ones we already added
-            const freshUsers = participants.filter(u => !isUserAlreadyAdded(u.id));
-            
-            if (freshUsers.length > 0) {
-                saveScrapedUsers(freshUsers, group.username);
-                scrapedUsers.push(...freshUsers);
-                logger.info(`Scraped ${freshUsers.length} fresh users from ${group.username}`);
+            const username = g.username;
+
+            // Skip if already in list
+            if (targetGroups.find(tg => tg.id.toString() === g.id.toString())) {
+                continue;
+            }
+
+            // Skip restricted
+            if (isRestrictedGroup(username)) {
+                continue;
+            }
+
+            // Get group info
+            const groupInfo = await getGroupInfo(client, username);
+
+            // Quality filter: member count 500-100k
+            if (groupInfo.members >= 500 && groupInfo.members <= 100000) {
+                targetGroups.push(g);
+                logger.success(`   ✅ Added ${username} (${groupInfo.members} members)`);
+            } else {
+                logger.info(`   ⏭️ Skipped ${username} (${groupInfo.members} members)`);
             }
         }
+
+        await randomDelay(3000, 6000);
     }
 
-    if (scrapedUsers.length === 0) {
-        logger.info("No new users scraped. Checking DB for previously scraped users...");
-        const dbUsers = getAllScrapedUsers().filter(u => !isUserAlreadyAdded(u.user_id));
-        scrapedUsers = dbUsers.map(u => ({ id: u.user_id, username: u.username }));
+    logger.info(`\n📊 Total groups to process: ${targetGroups.length}`);
+
+    // Step 4: Score all groups for quality
+    logger.info("\n🏆 Scoring groups for quality...");
+    const scoredGroups = await scoreGroups(targetGroups, config.niche);
+
+    // Sort by quality
+    scoredGroups.sort((a, b) => b.qualityScore - a.qualityScore);
+
+    // Log top 5
+    logger.info("🏆 Top 5 quality groups:");
+    scoredGroups.slice(0, 5).forEach((g, i) => {
+        logger.info(`   ${i + 1}. ${g.username} - Score: ${g.qualityScore}/10`);
+    });
+
+    // Step 5: Join and post to groups
+    logger.info("\n📥 Joining and posting...");
+    let postedCount = 0;
+    let joinedCount = 0;
+    let failedCount = 0;
+    let skippedCount = 0;
+
+    for (const group of scoredGroups) {
+        const username = group.username;
+
+        // Check daily limit
+        if (postedCount >= config.dailyPostLimit) {
+            logger.info("📊 Daily post limit reached!");
+            break;
+        }
+
+        // Skip if already posted
+        if (hasAlreadyPosted(group.id, msg.id)) {
+            skippedCount++;
+            logger.info(`⏭️ Already posted to ${username}`);
+            continue;
+        }
+
+        // Check if already joined
+        let alreadyJoined = existingGroups.some(g => g.id.toString() === group.id.toString());
+
+        if (!alreadyJoined) {
+            // Try to join
+            logger.info(`📥 Joining ${username}...`);
+            const joined = await joinChannel(client, username);
+
+            if (!joined) {
+                failedCount++;
+                logger.error(`❌ Failed to join ${username}`);
+                continue;
+            }
+
+            // Verify permissions
+            await randomDelay(2000, 4000);
+            const permissions = await checkGroupPermissions(client, username);
+
+            if (!permissions.canPost) {
+                logger.warn(`⚠️ ${username} doesn't allow posting`);
+                recordRestrictedGroup(username, 'no_post_permission');
+                await leaveChannel(client, username);
+                failedCount++;
+                continue;
+            }
+
+            joinedCount++;
+            recordGroupQuality(username, {
+                qualityScore: group.qualityScore,
+                members: group.members || 0
+            });
+        }
+
+        // Post the message
+        logger.info(`📤 Posting to ${username}...`);
+        const posted = await postMessage(client, group, sourceChannelId, msg.id, username);
+
+        if (posted) {
+            postedCount++;
+            recordPost(group.id, msg.id);
+            logger.success(`✅ Posted to ${username} (${postedCount}/${config.dailyPostLimit})`);
+        } else {
+            failedCount++;
+            logger.error(`❌ Failed to post to ${username}`);
+        }
+
+        // Delay between posts
+        if (postedCount < config.dailyPostLimit) {
+            await randomDelay(20000, 45000);
+        }
     }
 
-    if (scrapedUsers.length === 0) {
-        logger.warn("No users available to add. Exiting daily job.");
-        return;
+    // Step 6: Cleanup low-quality groups
+    logger.info("\n🧹 Starting cleanup...");
+    const allGroups = await getJoinedGroups(client);
+    let cleaned = 0;
+
+    for (const g of allGroups) {
+        const username = g.username || g.title;
+
+        // Check if restricted
+        if (isRestrictedGroup(username)) {
+            await leaveChannel(client, g);
+            cleaned++;
+            logger.info(`🚫 Left restricted: ${username}`);
+            continue;
+        }
+
+        // Check quality
+        const quality = getGroupQuality(username);
+
+        if (quality && quality.qualityScore < 3) {
+            await leaveChannel(client, g);
+            cleaned++;
+            logger.info(`🗑️ Removed low-quality: ${username}`);
+        }
+
+        await randomDelay(500, 1000);
     }
 
-    // 3. LLM Score -> select top 20
-    const needed = config.dailyAddLimit - addedToday;
-    logger.info(`Scoring ${scrapedUsers.length} users to select top ${needed}...`);
-    const selectedUsers = await scoreUsers(scrapedUsers, config.niche);
-    
-    const usersToAdd = selectedUsers.slice(0, needed);
-    logger.info(`Selected ${usersToAdd.length} top users to add.`);
+    // Final Summary
+    logger.info("\n========================================");
+    logger.info("📊 DAILY POST JOB COMPLETE");
+    logger.info("========================================");
+    logger.info(`   📥 Groups Joined: ${joinedCount}`);
+    logger.info(`   📤 Posts Made: ${postedCount}`);
+    logger.info(`   ⏭️ Skipped: ${skippedCount}`);
+    logger.info(`   ❌ Failed: ${failedCount}`);
+    logger.info(`   🧹 Cleaned: ${cleaned}`);
+    logger.info("========================================\n");
+}
 
-    if (usersToAdd.length === 0) {
-        logger.warn("No users selected by LLM. Exiting.");
-        return;
+/**
+ * Post message with retry logic
+ */
+async function postMessage(client, group, sourceChannelId, messageId, groupUsername, maxRetries = 3) {
+    // Resolve entities properly
+    let targetPeer;
+    let sourcePeer;
+
+    try {
+        targetPeer = await client.getEntity(groupUsername);
+    } catch (err) {
+        logger.error(`   ❌ Cannot resolve ${groupUsername}:`, err.message);
+        return false;
     }
 
-    // 4. Add to target channel
-    logger.info(`Adding users to target channel: ${config.targetChannel}`);
-    
-    // Save as contacts first
-    for (const u of usersToAdd) {
-        await addContact(client, u);
-        await randomDelay(2000, 5000);
+    try {
+        sourcePeer = await client.getEntity(sourceChannelId);
+    } catch (err) {
+        logger.error(`   ❌ Cannot resolve source:`, err.message);
+        return false;
     }
 
-    const addedCount = await inviteToChannel(client, config.targetChannel, usersToAdd);
-    
-    logger.success(`Daily job complete. Successfully added ${addedCount} users.`);
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            // Try forward with resolved entities
+            const result = await forwardMessage(client, targetPeer, sourcePeer, messageId);
+
+            if (result.success) {
+                return true;
+            }
+
+            if (result.errorType === 'FORBIDDEN') {
+                recordRestrictedGroup(groupUsername, 'forbidden');
+                return false;
+            }
+
+            // Try text message as fallback
+            if (result.errorType === 'TOPIC_CLOSED' || result.errorType === 'OTHER') {
+                logger.info(`   ⚠️ Forward failed, trying text message...`);
+
+                const textResult = await sendCustomMessage(client, targetPeer, message.message || 'Check out this content!', groupUsername);
+
+                if (textResult.success) {
+                    logger.success(`   ✅ Text message sent to ${groupUsername}`);
+                    return true;
+                }
+
+                if (textResult.errorType === 'FLOOD') {
+                    return false;
+                }
+
+                return false;
+            }
+
+            // Retry delay
+            if (attempt < maxRetries - 1) {
+                const delay = Math.pow(2, attempt) * 5000;
+                logger.info(`   🔄 Retrying in ${delay / 1000}s...`);
+                await sleep(delay);
+            }
+
+        } catch (err) {
+            logger.error(`   ❌ Error: ${err.message}`);
+
+            // Try text message on error
+            if (attempt === maxRetries - 1) {
+                logger.info(`   ⚠️ Trying text message as last resort...`);
+
+                const textResult = await sendCustomMessage(client, targetPeer, message.message || 'Check out this content!', groupUsername);
+
+                if (textResult.success) {
+                    logger.success(`   ✅ Text message sent to ${groupUsername}`);
+                    return true;
+                }
+
+                return false;
+            }
+
+            await sleep(3000);
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Legacy function for compatibility
+ */
+export async function runPostForwardingJob(client) {
+    // For backwards compatibility
+    const sourceChannelId = config.sourceChannel;
+
+    const msg = await getLatestMessage(client, sourceChannelId);
+    if (!msg) return;
+
+    const existingGroups = await getJoinedGroups(client);
+
+    for (const g of existingGroups) {
+        const username = g.username || g.title;
+
+        if (isRestrictedGroup(username)) continue;
+        if (hasAlreadyPosted(g.id, msg.id)) continue;
+
+        const posted = await postMessage(client, g, sourceChannelId, msg.id, username);
+
+        if (posted) {
+            recordPost(g.id, msg.id);
+        }
+
+        await randomDelay(15000, 30000);
+    }
+}
+
+/**
+ * Main entry point
+ */
+export async function runDailyJob() {
+    await runDailyPostJob();
 }

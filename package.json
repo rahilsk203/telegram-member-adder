@@ -7,7 +7,11 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node src/index.js",
-    "setup": "node --eval \"import('./src/index.js').then(m => m.runSetup())\""
+    "setup": "node --eval \"import('./src/index.js').then(m => m.runSetup())\"",
+    "super": "node test-super-agent.js",
+    "test:agent": "node test-agent.js",
+    "test:providers": "node test-providers.js",
+    "test:llm": "node test-llm.js"
   },
   "dependencies": {
     "@noble/hashes": "^1.7.1",
